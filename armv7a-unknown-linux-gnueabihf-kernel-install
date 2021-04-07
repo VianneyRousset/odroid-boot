@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+
+# Downloads, builds and install kernel, modules, dts and uInitramfs
+#
+# Kernel, dts and uInitramfs are installed in $CHOST/boot/
+# Modules are installed in $CHOST/lib/modules/
+#
+# The boot.ini read by the U-boot bootloader is left untouched.
+# This installation is not enough to boot, a signed U-boot still need to be
+# installed on the SD card, see: 
+# https://wiki.odroid.com/odroid-xu4/software/building_u-boot_mainline
+#
+# initramfs building is based on:
+# - https://wiki.gentoo.org/wiki/Custom_Initramfs
+# - https://jootamam.net/howto-initramfs-image.htm
+# - Dracut generated initramfs from the odroid default OS
+
+set -e
+
+KERNEL_URI='https://github.com/hardkernel/linux.git'
+KERNEL_BRANCH='odroidxu4-4.14.y'
+KERNEL_CONFIG='odroidxu4_defconfig'
+DTB="exynos5422-odroidxu4.dtb"
+BUSYBOX_URI="https://busybox.net/downloads/busybox-1.33.0.tar.bz2"
+NPROC="1"
+UNITRAMFS_NAME="uInitrd"
+
+# extract CHOST
+if [ -z "${CHOST}" ] ; then
+    CHOST=${0##*/}
+    CHOST=${CHOST%-kernel-install}
+    CHOST=${CHOST#kernel-install-}
+fi
+
+# extract BROOT
+BROOT=""
+if [ "${BROOT}" = "@"GENTOO_PORTAGE_EPREFIX"@" ] ; then
+    BROOT=""
+fi
+
+: ${EPREFIX=}
+: ${SYSROOT=${BROOT}/usr/${CHOST}}
+
+BOOTDIR="$SYSROOT/boot"
+
+# Print usage to stderr
+usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo
+    echo "Compile and install kernel image, modules and dts"
+    echo
+    echo "OPTIONS"
+    echo "  -h, --help          Print this help and exit"
+    echo "  -u, --uri           Kernel git url to use. Default:"
+    echo "                      https://github.com/hardkernel/linux.git"
+    echo "  -b, --branch        Kernel branch to use"
+    echo "                      Default: odroidxu4-4.14.y'"
+    echo "  -w, --working-dir   Working directory. If not, a temporary on"
+    echo "                      will be created."
+    echo "  -j                  Number of concurrent compilation processes."
+}
+
+# parse options
+options=$(getopt -o hubw:j: \
+    --long help \
+    --long uri \
+    --long branch \
+    --long working-dir: \
+    -- "$@") || (usage; exit 1)
+
+eval set -- "$options"
+
+while [[ $# -gt 1 ]]; do
+
+    case "$1" in
+
+        -h|--help)
+            usage
+            exit 0
+            ;;
+
+        -u|--uri)
+            KERNEL_URI="$2"
+            shift 2
+            ;;
+
+        -b|--branch)
+            KERNEL_BRANCH="$2"
+            shift 2
+            ;;
+
+        -w|--working-dir)
+            WORKING_DIR="$2"
+            shift 2
+            ;;
+
+        -j)
+            if [[ ! $2 =~ '^[0-9]+$' ]]; then
+                >&2 echo "A number is expected for -j, got: $2"
+            fi
+            NPROC="$2"
+            shift 2
+            ;;
+
+        *)
+            >&2 echo "Unexpected argument: $2"
+            >&2 usage
+            exit 1
+            ;;
+
+    esac
+
+done
+
+info() {
+    >&2 echo -e "\e[1m\e[36m* $@\e[0m"
+}
+
+success() {
+    >&2 echo -e "\e[1m\e[32m* $@\e[0m"
+}
+
+set_config() {
+    if [ -n "$3" ]; then
+        VALUE=$3
+    else
+        VALUE='y'
+    fi
+
+    if [ "$(cat $1 | grep CONFIG_$2)" ]; then
+	    sed -i 's|.*CONFIG_'$2'.*|CONFIG_'$2'='$VALUE'|' "$1"
+    else
+        echo "CONFIG_$2=$VALUE" >> "$1"
+    fi
+}
+
+clear_config() {
+    sed -i 's|.*CONFIG_'$2'.*|# CONFIG_'$2' is not set|' $1 
+}
+
+kernel_download() {
+    (
+        set -e
+        info "Downloading $KERNEL_URI $KERNEL_BRANCH."
+        git clone "$KERNEL_URI" -b "$KERNEL_BRANCH" --depth 1 linux
+        success "Kernel downloaded."
+    )
+}
+
+kernel_prepare() {
+    (
+        set -e
+        cd linux
+
+        # configurate
+        if [ ! -f .config ]; then
+
+		# config, use default config
+		info "Configuring kernel with $KERNEL_CONFIG"
+		KERNEL=kernel7l make ARCH=arm "$KERNEL_CONFIG"
+
+		# bundle initramfs into kernel image
+		#set_config .config INITRAMFS_SOURCE '"../initramfs"'
+		#echo 'CONFIG_INITRAMFS_ROOT_UID=0' >> .config
+		#echo 'CONFIG_INITRAMFS_ROOT_GID=0' >> .config
+		#echo 'CONFIG_INITRAMFS_COMPRESSION=".gz"' >> .config
+
+		# disable RTL8812AU USB wireless module, compilation error
+		clear_config .config RTL8812AU
+
+		success "Kernel configured"
+	fi
+    )
+}
+
+kernel_build() {
+    (
+        set -e
+        cd linux
+
+        # compile kernel and dts
+        info "Compiling kernel"
+        make ARCH=arm CROSS_COMPILE="$CHOST-" -j $NPROC zImage $DTB
+        success "Kernel compiled"
+    )
+}
+
+kernel_build_modules() {
+    (
+        set -e
+        cd linux
+
+        # compile modules
+        info "Compiling kernel modules"
+        make ARCH=arm CROSS_COMPILE="$CHOST-" -j $NPROC modules
+        success "Kernel modules compiled"
+    )
+}
+
+kernel_install() {
+    (
+        set -e
+        cd linux
+
+
+        # copy zImage
+        info "Copying kernel image into $BOOTDIR"
+        cp arch/arm/boot/zImage $BOOTDIR
+        info "Kernel image copied"
+
+        # copy dts
+        info "Copying DTS $DTS into $BOOTDIR"
+        cp arch/arm/boot/dts/$DTB $BOOTDIR
+        info "DTS copied"
+
+        # installing modules
+        info "Installing kernel modules into $SYSROOT"
+        make ARCH=arm CROSS_COMPILE=$CHOST- \
+            INSTALL_MOD_PATH="$SYSROOT" modules_install 
+    )
+}
+
+busybox_download() {
+    (
+        set -e
+
+        info "Downloading $BUSYBOX_URI."
+        mkdir -p busybox
+        wget "$BUSYBOX_URI" -O - | tar --extract --bzip2 \
+            --strip-component=1  --directory=busybox --file -
+                success "Busybox downloaded."
+    )
+}
+
+busybox_prepare() {
+    (
+        set -e
+        cd busybox
+
+        # configurate
+        if [ ! -f .config ]; then
+            info "Configurating busybox."
+            make ARCH=arm defconfig > /dev/null
+
+            # staticlib
+            set_config .config STATIC
+            set_config .config STATIC_LIBGCC
+
+            success "Busybox configurated."
+        fi
+    )
+}
+
+busybox_build() {
+    (
+        set -e
+        cd busybox
+
+        # compile
+        info "Compiling busybox."
+        make ARCH=arm CROSS_COMPILE="$CHOST-" -j $NPROC
+        success "Busybox compiled."
+    )
+}
+
+initramfs_prepare() {
+    (
+        set -e
+        mkdir --parents initramfs
+
+        # config and build busybox
+        busybox_prepare && busybox_build
+
+        # install busybox
+        (
+            set -e
+            cd busybox
+
+            info "Installing busybox into initramfs env."
+            make ARCH=arm CROSS_COMPILE="$CHOST-" CONFIG_PREFIX=../initramfs \
+                -j $NPROC install
+            success "Busybox installed into initramfs env."
+        )
+
+        (
+            set -e
+            cd initramfs
+
+            mkdir --parents bin dev etc lib mnt/root proc root sbin sys
+            #touch initramfs/etc/mdev.conf
+
+            # create init script
+            cat > init << 'EOT'
+#!/usr/bin/env sh
+
+ROOTFS_MOUNTPOINT='/mnt/root'
+ROOTFS_INIT='/sbin/init'
+
+# Mount the /proc and /sys filesystems.
+mount -t proc none /proc
+mount -t sysfs none /sys
+#mount -t tmpfs /dev /dev
+#mount -t tmpfs -o rw,nosuid,nodev,relatime,mode=755 none /run 2>&1
+
+# look for devices
+mdev -s
+
+# get command line given to the kernel
+CMDLINE=$(cat /proc/cmdline)
+
+# parse command line
+for x in ${CMDLINE}
+do
+    case "${x}" in
+
+        root=*)
+            CMDROOT=${x#*=}
+            ;;
+
+        ro)
+            MOUNT_RO='-o ro'
+            ;;
+
+        esac
+    done
+
+# find and mount rootfs
+echo "$CMDROOT" | grep -E '^LABEL=.*|^UUID=.*|^PARTLABEL=.*|^PARTUUID=.*'
+if [ $? == 0 ]; then
+    mount $MOUNT_RO "$(findfs $CMDROOT)" "$ROOTFS_MOUNTPOINT"
+else
+    mount $MOUNT_RO "$CMDROOT" "$ROOTFS_MOUNTPOINT"
+fi
+
+echo "ROOTFS mounted $MOUNT_RO"
+
+# check if init script exists and is executable
+if [[ -x "$ROOTFS_MOUNTPOINT/$ROOTFS_INIT" ]] ; then
+
+	mount --move /sys $ROOTFS_MOUNTPOINT/sys
+	mount --move /proc $ROOTFS_MOUNTPOINT/proc
+	mount --move /dev $ROOTFS_MOUNTPOINT/dev
+	#mount -t tmpfs /dev $ROOTFS_MOUNTPOINT/dev
+	mount -t devtmpfs none $ROOTFS_MOUNTPOINT/dev
+	#mount -t tmpfs -o "exec,nosuid,mode=0755,size=10M" udev /dev \
+        #                || echo "Failed to mount /dev as tmpfs"
+
+	#Switch to the new root and execute init
+	echo "Switching root $ROOTFS_MOUNTPOINT $ROOTFS_INIT"
+	exec switch_root "$ROOTFS_MOUNTPOINT" "$ROOTFS_INIT"
+fi
+
+echo "No executable init script found at $ROOTFS_MOUNTPOINT$ROOTFS_INIT"
+
+exec sh
+EOT
+
+        chmod +x init
+        )
+    )
+}
+
+initramfs_build() {
+    (
+        set -e
+
+        (
+            set -e
+            cd initramfs
+
+            find . -print0 | cpio --null --create --verbose --format=newc \
+                | gzip --best > ../initramfs.cpio.gz
+        )
+
+        mkimage -A arm -O linux -T ramdisk -C gzip -a 0 -e 0 \
+            -d initramfs.cpio.gz "$UNITRAMFS_NAME"
+    )
+}
+
+initramfs_install() {
+    (
+        set -e
+        cp "$UNITRAMFS_NAME" $BOOTDIR
+    )
+}
+
+# default working dir
+if [ ! "$WORKING_DIR" ]; then
+    WORKING_DIR="$(mktemp --directory --suffix=-$CHOST-kernel-install)"
+else
+    mkdir --parents "$WORKING_DIR"
+fi
+
+cd "$WORKING_DIR"
+info "Woking directory: $(pwd)"
+
+# download Linux if not present
+if [ ! -d "linux" ]; then
+    info "No linux directory found in $(pwd)."
+    kernel_download
+else
+    >&2 echo "linux directory found in $(pwd)."
+fi
+
+# build and install kernel, modules and dts
+kernel_prepare && kernel_build && kernel_build_modules && kernel_install
+
+# download busybox if not present
+if [ ! -d "busybox" ]; then
+    info "No busybox directory found in $(pwd)."
+    busybox_download
+else
+    success "busybox directory found in $(pwd)."
+fi
+
+# prepare, build and install initramfs
+initramfs_prepare && initramfs_build && initramfs_install
+
+success 'Success'
